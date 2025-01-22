@@ -1,0 +1,97 @@
+Projet : Gestion d'un Système Autonome d'Énergie Solaire
+
+Introduction
+
+Dans le cadre du projet E6 à finalité technique, il a été proposé de développer un système autonome combinant des énergies renouvelables et des technologies embarquées. En tant qu'étudiant 1, ma mission consiste à réaliser la gestion du panneau solaire et de la batterie pour mesurer et afficher la tension, ainsi que la mise en place d'une sonde de température permettant la mesure et l'affichage des données. Une interface homme-machine (IHM) via Bluetooth est également à développer.
+
+1. Objectifs du Projet
+
+Gestion énergétique : Mise en place d'un système permettant de mesurer la tension à la sortie d'un panneau solaire et de sa batterie.
+
+Capteurs de température : Utilisation d'une sonde MLX90614 pour mesurer la température et afficher les données sur un écran LCD Grove.
+
+Interface utilisateur : Implémentation d'une communication Bluetooth pour transmettre les informations mesurées vers une application mobile ou un terminal.
+
+2. Spécifications Techniques
+
+2.1. Matériels Utilisés
+
+ESP32 : Microcontrôleur avec connectivité WiFi et Bluetooth pour la gestion des capteurs et de l'IHM.
+
+MLX90614 : Capteur de température infrarouge pour une mesure précise et sans contact.
+
+Écran LCD Grove : Affichage des mesures de tension et de température.
+
+Panneau solaire : Source d'énergie renouvelable.
+
+Batterie : Stockage de l'énergie pour une alimentation continue.
+
+2.2. Logiciels Utilisés
+
+Arduino IDE : Programmation du microcontrôleur ESP32.
+
+Proteus : Simulation des circuits et validation du schéma électronique.
+
+App Inventor : Création de l'application mobile pour l'IHM Bluetooth.
+
+2.3. Contraintes
+
+Budget : 1000 € pour le projet global.
+
+Délais : Livraison finale le 21 mai 2025.
+
+Autonomie énergétique : Fonctionnement continu grâce au panneau solaire.
+
+3. Développement et Intégration
+
+3.1. Gestion du Panneau Solaire et Batterie
+
+Mesure de la tension : Utilisation d'un diviseur de tension pour adapter la plage de mesure de l'ESP32.
+
+Affichage : Les valeurs mesurées sont envoyées à l'écran LCD Grove pour une lecture locale.
+
+3.2. Sonde de Température MLX90614
+
+Configuration : Le capteur est connecté à l'ESP32 via le protocole I2C.
+
+Traitement : Les données sont interprétées pour être présentées sous forme lisible (°C ou °F).
+
+Affichage : Les résultats sont affichés en temps réel sur le LCD.
+
+3.3. Interface Bluetooth
+
+Mise en œuvre : Utilisation de la connectivité Bluetooth de l'ESP32 pour transmettre les données.
+
+Application mobile : Une application simple permet de récupérer les mesures via une connexion Bluetooth.
+
+4. Résultats Attendus
+
+Mesure précise et affichage de la tension et de la température.
+
+Transmission des données via Bluetooth pour une consultation à distance.
+
+Interface ergonomique et fiable, accessible aux utilisateurs novices.
+
+5. Planification
+
+Semaine 3 : Début du projet, étude des besoins.
+
+Semaine 6 : Premiers tests des capteurs et de l'affichage.
+
+Semaine 14 : Intégration de l'IHM Bluetooth.
+
+Semaine 21 : Finalisation et validation du prototype.
+
+21 mai 2025 : Remise du projet.
+
+Conclusion
+
+Ce projet illustre une approche pratique de la gestion énergétique autonome avec une combinaison de technologies modernes. Le développement prévu permettra de répondre aux exigences techniques tout en étant conforme au cahier des charges.
+
+Annexes
+
+Schémas électroniques.
+
+Codes sources Arduino.
+
+Documentation utilisateur.
