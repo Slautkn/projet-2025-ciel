@@ -1,0 +1,47 @@
+code gravity + écran 
+
+
+
+#include "DFRobot_VEML7700.h"  // Inclure la bibliothèque pour le capteur de lumière VEML7700
+#include <Wire.h>              // Inclure la bibliothèque Wire pour la communication I2C
+#include "rgb_lcd.h"           // Inclure la bibliothèque pour l'écran LCD RGB
+
+// Créer des objets pour interagir avec le capteur de lumière et l'écran LCD
+DFRobot_VEML7700 als;  // Objet pour le capteur de lumière ambiante (ALS)
+rgb_lcd lcd;           // Objet pour l'écran LCD RGB
+
+void setup() {
+    // Initialiser le moniteur série pour afficher les données sur le terminal
+    Serial.begin(9600);
+    
+    // Initialiser l'écran LCD avec 16 colonnes et 2 lignes
+    lcd.begin(16, 2);
+    
+    // Initialiser le capteur de lumière ambiante (VEML7700)
+    als.begin();   
+
+    // Afficher un message d'initialisation sur l'écran LCD
+    lcd.print("Initializing...");
+    delay(1000);  // Attendre 1 seconde pour que le message soit visible
+    lcd.clear();   // Effacer l'écran LCD après l'affichage du message initial
+}
+
+void loop() {
+    float lux;  // Variable pour stocker la valeur de la lumière ambiante en lux
+  
+    // Obtenir la valeur de la lumière ambiante mesurée par le capteur
+    als.getALSLux(lux);   
+    
+    // Afficher la valeur de lux sur l'écran LCD
+    lcd.setCursor(0, 0);  // Placer le curseur en haut à gauche de l'écran
+    lcd.print("Lux: ");    // Afficher "Lux: " sur la première ligne
+    lcd.print(lux);        // Afficher la valeur de lux
+    lcd.print(" lx");      // Afficher " lx" pour indiquer l'unité
+
+    // Afficher également la valeur de lux sur le moniteur série pour le suivi
+    Serial.print("Lux: ");  // Afficher "Lux: " sur le moniteur série
+    Serial.print(lux);      // Afficher la valeur de lux
+    Serial.println(" lx");  // Afficher l'unité " lx" et aller à la ligne suivante sur le moniteur série
+
+    delay(2000);  // Attendre 2 secondes avant de faire une nouvelle mesure
+}
