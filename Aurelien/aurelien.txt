@@ -1,0 +1,181 @@
+ecran + horodatage 
+
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_TFTLCD.h>
+#include <Adafruit_BMP280.h>
+#include <RTClib.h>  // Ajout de la bibliothèque RTC
+
+// Définition des broches de l'écran TFT
+#define LCD_CS   A3
+#define LCD_CD   A2  // Command/Data
+#define LCD_WR   A1
+#define LCD_RD   A0
+#define LCD_RST  A6
+
+// Définition des couleurs
+#define BLACK   0x0000
+#define WHITE   0xFFFF
+#define BLUE    0x001F
+#define RED     0xF800
+#define CYAN    0x07FF
+#define YELLOW  0xFFE0
+#define GREEN   0x07E0
+#define ORANGE  0xFD20
+
+// Initialisation de l'écran TFT
+Adafruit_TFTLCD tft(LCD_CS, LCD_CD, LCD_WR, LCD_RD, LCD_RST);
+
+// Initialisation du capteur BMP280
+Adafruit_BMP280 bmp;
+
+// Création d'un objet RTC (DS3231)
+RTC_DS3231 rtc;
+
+// Broche pour lire la tension de la batterie
+int pinBatterie = A7;
+float tensionBatterie = 0;
+
+void setup() {
+    Serial.begin(9600);
+
+    // Initialisation de l'écran TFT
+    tft.reset();
+    uint16_t identifier = tft.readID();
+    if (identifier == 0x9341) {
+        tft.begin(identifier);
+    } else {
+        Serial.println("Échec de l'initialisation de l'écran!");
+        while (1);
+    }
+
+    tft.setRotation(0);
+    tft.fillScreen(BLACK);
+
+    // Affichage du titre pour la température
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(50, 80);  // Nouveau positionnement du titre
+    tft.print("Temperature");
+    tft.drawRect(10, 100, 220, 100, CYAN);  // Nouveau positionnement du cadre
+
+    // Initialisation du capteur BMP280
+    if (!bmp.begin(0x76)) {
+        Serial.println("Échec de la détection du BMP280!");
+        tft.setCursor(30, 60);
+        tft.setTextColor(RED);
+        tft.print("BMP280 Erreur!");
+        while (1);
+    }
+
+    // Vérifie si le module RTC est correctement connecté
+    if (!rtc.begin()) {
+        Serial.println("Impossible de trouver le module RTC");
+        while (1);
+    }
+
+    // Vérifie si la RTC a perdu l'heure, et la réinitialise si nécessaire
+    if (rtc.lostPower()) {
+        Serial.println("RTC perdu l'alimentation. Réinitialisation de l'heure...");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+}
+
+void drawBatteryIcon(int x, int y, int width, int height, int level) {
+    // Dessiner le contour de la batterie
+    tft.drawRect(x, y, width, height, WHITE);
+
+    // Dessiner l'intérieur de la batterie (vide)
+    tft.fillRect(x + 2, y + 2, width - 4, height - 4, BLACK);
+
+    // Déterminer la couleur en fonction du niveau de charge
+    uint16_t color;
+    if (level > 50) {
+        color = GREEN;  // Vert pour plus de 50%
+    } else if (level >= 30) {
+        color = ORANGE; // Orange entre 50% et 30%
+    } else {
+        color = RED;    // Rouge pour moins de 30%
+    }
+
+    // Remplir la batterie en fonction du niveau (avec la couleur déterminée)
+    int fillWidth = map(level, 0, 100, 0, width - 4);
+    tft.fillRect(x + 2, y + 2, fillWidth, height - 4, color);
+}
+
+void loop() {
+    // Lire la valeur analogique de la batterie
+    int valeurLue = analogRead(pinBatterie);
+
+    // Convertir la valeur lue en tension (0-5V)
+    float tensionADC = (valeurLue / 1023.0) * 5.0;
+
+    // Calculer la tension réelle de la batterie avec le pont diviseur
+    tensionBatterie = tensionADC * (14.0 / 5.0);
+
+    // Calcul du pourcentage de la batterie, avec une plage de 0V à 14V
+    int pourcentageBatterie = map(tensionBatterie * 1000, 0, 14000, 0, 100);
+
+    // Limiter le pourcentage entre 0 et 100
+    if (pourcentageBatterie < 0) pourcentageBatterie = 0;
+    if (pourcentageBatterie > 100) pourcentageBatterie = 100;
+
+    // Effacer l'affichage précédent de la batterie et du pourcentage
+    tft.fillRect(150, 10, 60, 40, BLACK);  // Effacez la zone de la batterie et du pourcentage en haut à droite
+
+    // Affichage du pourcentage de la batterie au-dessus de l'icône
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(2);
+    tft.setCursor(160, 20);  // Position du texte du pourcentage
+    tft.print(pourcentageBatterie);
+    tft.print("%");
+
+    // Dessiner l'icône de la batterie avec le niveau de charge dynamique
+    drawBatteryIcon(200, 17, 40, 20, pourcentageBatterie); // Position et taille de l'icône de la batterie en haut à droite
+
+    // Lire la température du capteur BMP280
+    float temperature = bmp.readTemperature();
+    Serial.print("Temperature: ");
+    Serial.print(temperature);
+    Serial.println(" °C");
+
+    // Effacer l'affichage précédent de la température
+    tft.fillRect(20, 130, 200, 50, BLACK); // Effacez l'ancienne température et son cadre
+
+    // Affichage de la température au centre de l'écran
+    tft.setTextColor(YELLOW);
+    tft.setTextSize(4);
+    tft.setCursor(50, 140);  // Position centrée pour la température
+    tft.print(temperature);
+    tft.print(" C");
+
+    // Récupère l'heure et la date actuelles depuis le module RTC
+    DateTime now = rtc.now();
+
+    // Effacer l'affichage précédent de la date et de l'heure
+    tft.fillRect(0, 210, 320, 100, BLACK);  // Effacer la zone de l'heure et de la date
+
+    // Affichage de l'heure
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(30, 230); // Position de l'heure
+    tft.print("Heure : ");
+    tft.print(now.hour(), DEC);
+    tft.print(":");
+    if (now.minute() < 10) tft.print("0");
+    tft.print(now.minute(), DEC);
+    tft.print(":");
+    if (now.second() < 10) tft.print("0");
+    tft.print(now.second(), DEC);
+
+    // Affichage de la date
+    tft.setCursor(70, 280); // Position de la date
+    tft.print(now.day(), DEC);
+    tft.print("/");
+    tft.print(now.month(), DEC);
+    tft.print("/");
+    tft.print(now.year(), DEC);
+
+    delay(1000); // Rafraîchissement toutes les secondes
+}
