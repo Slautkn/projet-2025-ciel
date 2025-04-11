@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Moniteur ESP32</string>
+    <string name="connect">Connecter</string>
+    <string name="disconnect">Déconnecter</string>
+    <string name="scan">Rechercher</string>
+    <string name="temperature">Température (°C)</string>
+    <string name="voltage">Tension (V)</string>
+    <string name="battery">Batterie (%)</string>
+    <string name="timestamp">Horodatage</string>
+    <string name="brightness">Luminosité (lux)</string>
+    <string name="no_device">Aucun appareil connecté</string>
+    <string name="connected_to">Connecté à: %1$s</string>
+    <string name="connection_failed">Échec de la connexion</string>
+    <string name="bluetooth_not_supported">Bluetooth non supporté</string>
+    <string name="permission_denied">Permissions refusées</string>
+</resources> 
