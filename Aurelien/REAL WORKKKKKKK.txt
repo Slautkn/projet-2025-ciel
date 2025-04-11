@@ -1,0 +1,266 @@
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to enable it
+#endif
+
+// Définition des constantes pour éviter la duplication et améliorer la lisibilité
+#define ANALOG_PIN 15
+#define UPDATE_INTERVAL 1000
+#define BT_NAME "ESP32_TempVoltage"
+#define BMP280_ADDR_1 0x76
+#define BMP280_ADDR_2 0x77
+
+// Nouvelle calibration: 14V -> 3V
+const float ADC_REFERENCE = 3.3;
+const float ADC_RESOLUTION = 4095.0;
+const float CONVERSION_FACTOR = ADC_REFERENCE / ADC_RESOLUTION;
+const float VOLTAGE_RATIO = 14.0 / 3.0; // 14V est équivalent à 3V mesurés
+const float BATTERY_MAX_VOLTAGE = 14.0;
+const float BATTERY_MIN_VOLTAGE = 10.5;
+
+// Couleurs
+#define WHITE       0xFFFF
+#define BLACK       0x0000
+#define BLUE        0x001F
+#define RED         0xF800
+#define GREEN       0x07E0
+#define CYAN        0x07FF
+#define MAGENTA     0xF81F
+#define YELLOW      0xFFE0
+#define ORANGE      0xFD20
+#define PURPLE      0x780F
+#define DARKGREEN   0x03E0
+#define NAVY        0x000F
+#define MAROON      0x7800
+#define OLIVE       0x7BE0
+#define DARKGREY    0x7BEF
+#define LIGHTGREY   0xC618
+
+// Déclaration des objets
+BluetoothSerial SerialBT;
+TFT_eSPI tft = TFT_eSPI();
+Adafruit_BMP280 bmp;
+
+// Variables globales
+float voltage = 0.0;
+float batteryVoltage = 0.0;
+int batteryPercentage = 0;
+float temperature = 0.0;
+unsigned long lastUpdate = 0;
+
+// Prototypes de fonctions pour améliorer l'organisation
+void setupADC();
+void setupBMP280();
+void setupDisplay();
+void drawUI();
+float readVoltage();
+float readTemperature();
+void updateDisplay();
+void sendDataBluetooth(float temp, float volt);
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin(BT_NAME);
+  
+  Serial.println(F("Démarrage du moniteur de batterie et température..."));
+  
+  setupADC();
+  setupBMP280();
+  setupDisplay();
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = currentMillis;
+    
+    // Lire et traiter les données
+    voltage = readVoltage();
+    batteryVoltage = voltage * VOLTAGE_RATIO;
+    batteryPercentage = constrain(map(int(batteryVoltage * 100), 
+                                 int(BATTERY_MIN_VOLTAGE * 100), 
+                                 int(BATTERY_MAX_VOLTAGE * 100), 
+                                 0, 100), 0, 100);
+    
+    temperature = readTemperature();
+    
+    // Afficher et envoyer les données
+    updateDisplay();
+    sendDataBluetooth(temperature, batteryVoltage);
+    
+    // Debug
+    Serial.printf("Tension: %.2fV (raw: %.2fV) | Batterie: %.2fV (%d%%) | Temp: %.1f°C\n", 
+                  batteryVoltage, voltage, batteryVoltage, batteryPercentage, temperature);
+  }
+}
+
+void setupADC() {
+  analogSetWidth(12);         // Résolution 12 bits (0-4095)
+  analogSetAttenuation(ADC_11db); // Plage d'entrée 0-3.3V
+}
+
+void setupBMP280() {
+  unsigned status = bmp.begin(BMP280_ADDR_1);
+  if (!status) {
+    status = bmp.begin(BMP280_ADDR_2);
+    if (!status) {
+      Serial.println(F("Erreur: Capteur BMP280 introuvable!"));
+      // Continue même sans capteur (affichera des valeurs par défaut)
+    }
+  }
+  
+  bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                 Adafruit_BMP280::SAMPLING_X2,
+                 Adafruit_BMP280::SAMPLING_X16,
+                 Adafruit_BMP280::FILTER_X16,
+                 Adafruit_BMP280::STANDBY_MS_500);
+}
+
+void setupDisplay() {
+  tft.init();
+  tft.setRotation(2);  // Paysage
+  tft.fillScreen(BLACK);
+  
+  // Affichage d'un écran de démarrage
+  tft.setTextColor(CYAN, BLACK);
+  tft.setTextSize(3);
+  tft.setCursor(30, 80);
+  tft.println("SMART MONITOR");
+  tft.setTextSize(2);
+  tft.setCursor(45, 130);
+  tft.setTextColor(WHITE, BLACK);
+  tft.println("Temperature & Tension");
+  
+  // Animation de chargement
+  for (int i = 0; i < 300; i += 10) {
+    tft.fillRect(10 + i, 180, 10, 20, BLUE);
+    delay(15);
+  }
+  
+  tft.fillScreen(BLACK);
+  drawUI();
+}
+
+void drawUI() {
+  // Nouveau design: fond sombre avec cadres modernes
+  tft.fillScreen(NAVY);
+  
+  // Entête
+  tft.fillRoundRect(0, 0, 320, 50, 0, DARKGREY);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(40, 15);
+  tft.println("MONITEUR INTELLIGENT");
+  
+  // Panneau de température
+  tft.fillRoundRect(10, 60, 300, 70, 10, DARKGREY);
+  tft.drawRoundRect(10, 60, 300, 70, 10, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 70);
+  tft.println("Temperature");
+  
+  // Panneau de tension
+  tft.fillRoundRect(10, 140, 300, 70, 10, DARKGREY);
+  tft.drawRoundRect(10, 140, 300, 70, 10, WHITE);
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(20, 150);
+  tft.println("Tension");
+  
+  // Cadre de la barre de batterie
+  tft.fillRoundRect(10, 220, 300, 40, 10, DARKGREY);
+  tft.drawRoundRect(10, 220, 300, 40, 10, WHITE);
+  
+  // Barre de batterie (contour)
+  tft.drawRoundRect(20, 225, 280, 30, 5, WHITE);
+}
+
+float readVoltage() {
+  // Moyenne sur 20 lectures pour plus de stabilité
+  int sumReadings = 0;
+  for (int i = 0; i < 20; i++) {
+    sumReadings += analogRead(ANALOG_PIN);
+    delay(2);
+  }
+  float avgReading = sumReadings / 20.0;
+  
+  return avgReading * CONVERSION_FACTOR;
+}
+
+float readTemperature() {
+  float tempReading = bmp.readTemperature();
+  
+  // Validation des lectures (évite les valeurs aberrantes)
+  if (isnan(tempReading) || tempReading > 100 || tempReading < -40) {
+    Serial.println(F("Erreur de lecture de température!"));
+    return temperature; // Garde la valeur précédente
+  }
+  
+  return tempReading;
+}
+
+void updateDisplay() {
+  // Température avec icône
+  tft.fillRect(20, 90, 280, 30, DARKGREY);
+  tft.setTextColor(CYAN);
+  tft.setTextSize(3);
+  tft.setCursor(120, 90);
+  tft.print(temperature, 1);
+  tft.print(" C");
+  
+  // Petite icône de thermomètre
+  tft.fillRect(90, 95, 5, 20, RED);
+  tft.fillCircle(90, 115, 5, RED);
+  
+  // Tension avec icône
+  tft.fillRect(20, 170, 280, 30, DARKGREY);
+  tft.setTextColor(YELLOW);
+  tft.setTextSize(3);
+  tft.setCursor(120, 170);
+  tft.print(batteryVoltage, 1);
+  tft.print(" V");
+  
+  // Petite icône de batterie
+  tft.drawRect(80, 175, 20, 12, YELLOW);
+  tft.drawRect(100, 178, 3, 6, YELLOW);
+  
+  // Mise à jour de la barre de batterie
+  int barWidth = map(batteryPercentage, 0, 100, 0, 276);
+  tft.fillRect(22, 227, 276, 26, BLACK);  // Effacer l'ancienne barre
+  
+  // Choisir la couleur selon le niveau de batterie
+  uint16_t barColor;
+  if (batteryPercentage > 75) {
+    barColor = GREEN;
+  } else if (batteryPercentage > 50) {
+    barColor = OLIVE;
+  } else if (batteryPercentage > 25) {
+    barColor = ORANGE;
+  } else {
+    barColor = RED;
+  }
+  
+  // Dessiner la nouvelle barre avec arrondi
+  tft.fillRoundRect(22, 227, barWidth, 26, 5, barColor);
+  
+  // Afficher le pourcentage au centre de la barre
+  tft.setTextColor(WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(135, 230);
+  tft.print(batteryPercentage);
+  tft.print("%");
+}
+
+void sendDataBluetooth(float temp, float volt) {
+  // Format compact JSON pour compatibilité avec plus d'applications
+  String data = "{\"temp\":" + String(temp, 1) + ",\"volt\":" + String(volt, 1) + 
+                ",\"batt\":" + String(batteryPercentage) + "}";
+  SerialBT.println(data);
+}
