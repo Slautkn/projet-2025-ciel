@@ -1,0 +1,15 @@
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.1.0'
+    }
+}
+
+// Le bloc allprojects a été supprimé car les référentiels sont déjà déclarés dans settings.gradle
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+} 
