@@ -1,7 +1,7 @@
 # projet-2025-ciel
 snap
 
-les gars vous allez mettre les lien ici
+Mettre les Lien ici
 
 https://www.mermaidchart.com/app/projects/65c57da3-cbfa-49d7-bb6f-27b8c1d45519/diagrams/395085ad-f1e0-4e92-a972-15f230f97018/version/v0.1/edit  GANT
 
