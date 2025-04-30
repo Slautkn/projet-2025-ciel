@@ -1,68 +1,237 @@
-GPS + LIGHT SENSOR
+/**************************************************************************
+ * CODE POUR ELEVE 3
+ * - Capteurs Locaux: GPS Ultimate (UART2 HW), Lux VEML7700 (I2C)
+ * - Affichage: LCD RGB I2C
+ * - Communication:
+ *   - Envoie Lux/GPS à E1 via UART1 (Pins 26, 25)
+ *   - Envoie Lux/GPS à E2 via UART0 (Pins 15, 13)
+ *   - Moniteur Série USB FONCTIONNEL pour le debug
+ **************************************************************************/
 
-
-
-
-
-#include <TinyGPSPlus.h> // Bibliothèque pour parser les données GPS
-#include <Wire.h>       // Bibliothèque pour la communication I2C
-#include "rgb_lcd.h"    // Bibliothèque pour l'écran LCD RGB
+#include <HardwareSerial.h> // Pour Serial0 et Serial1 custom
+#include <TinyGPSPlus.h>    // Bibliothèque pour parser les données GPS
+#include <Wire.h>           // Bibliothèque pour la communication I2C
+#include "rgb_lcd.h"        // Bibliothèque pour l'écran LCD RGB (Assurez-vous que c'est la bonne lib)
 #include "DFRobot_VEML7700.h"  // Bibliothèque pour le capteur de lumière VEML7700
 
-// Définition des pins RX et TX pour la communication série 2
-#define RXD2 16
-#define TXD2 17
-
-// Vitesse de communication série (bauds)
+// --- Configuration ---
+// Pins pour le GPS (UART2 Hardware)
+#define GPS_RX_PIN 16 // RXD2
+#define GPS_TX_PIN 17 // TXD2
 #define GPS_BAUD 9600
 
-// Création d'objets pour les capteurs et l'affichage
+// Pins pour la communication INTER-ESP (Basé sur discussion et pins libres révisées)
+#define E3_TX_TO_E1_PIN   25 // UART1 TX --> E1 RX1 (33)
+#define E3_RX_FROM_E1_PIN 26 // UART1 RX <-- E1 TX1 (32) - Pour recevoir "Hi"
+#define E3_TX_TO_E2_PIN   13 // UART0 TX --> E2 RX2 (18)
+#define E3_RX_FROM_E2_PIN 15 // UART0 RX <-- E2 TX2 (19) - Pour recevoir "Hi"
+
+#define SEND_INTERVAL 2000 // Envoyer données toutes les 2 secondes
+
+// --- Objets Globaux ---
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(2);
-rgb_lcd lcd;
-DFRobot_VEML7700 als;
+HardwareSerial gpsSerial(2);     // GPS utilise UART2 Hardware intégré
+HardwareSerial Serial_E1(1);     // UART1 (mappé) pour comm avec E1
+HardwareSerial Serial_E2(0);     // UART0 (mappé) pour comm avec E2
+rgb_lcd lcd;                // Ecran LCD I2C
+DFRobot_VEML7700 als;       // Capteur lumière I2C
 
+// --- Variables Globales ---
+float current_lux = -1.0;
+float current_lat = 0.0;
+float current_lon = 0.0;
+bool  current_fix = false;
+unsigned long lastSend = 0;
+
+// --- Prototypes ---
+void setupSensors();
+void setupLCD();
+void setupUARTs(); // Modifié
+void readSensors();
+void sendDataToPeers(); // Modifié
+void displayDataLCD();
+void checkIncomingMessages(); // Pour lire les "Hi"
+
+// =========================================================================
+// SETUP
+// =========================================================================
 void setup() {
-    Serial.begin(115200);  // Moniteur série
-    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2); // GPS
-    lcd.begin(16, 2);  // LCD
-    als.begin();  // Capteur de lumière
+    Serial.begin(115200); // Moniteur série USB pour E3 (OK)
+    Serial.println("E3: Démarrage...");
 
-    lcd.print("Initializing...");
+    Wire.begin(); // Pour le capteur de lumière et LCD I2C
+
+    setupSensors();
+    setupLCD();
+    setupUARTs(); // Initialise UART0 et UART1 pour envoyer à E1/E2
+
+    lcd.print("E3 Initialise...");
     delay(1000);
     lcd.clear();
+    Serial.println("E3: Initialisation terminee.");
 }
 
+// =========================================================================
+// LOOP
+// =========================================================================
 void loop() {
-    // Lecture des données GPS
-    unsigned long start = millis();
-    while (millis() - start < 1000) {
-        while (gpsSerial.available() > 0) {
-            gps.encode(gpsSerial.read());
+    unsigned long currentMillis = millis();
+
+    // Lire les capteurs GPS et Lumière en continu
+    readSensors();
+
+    // Afficher sur l'écran LCD local (alternance gérée dans la fonction)
+    displayDataLCD();
+
+    // Vérifier messages entrants (non bloquant)
+    checkIncomingMessages();
+
+    // Envoyer les données aux autres ESP périodiquement
+    if (currentMillis - lastSend >= SEND_INTERVAL) {
+        lastSend = currentMillis;
+        sendDataToPeers();
+    }
+
+    // Permettre au GPS de traiter les données en arrière plan
+    while (gpsSerial.available() > 0) {
+       if (gps.encode(gpsSerial.read())) {
+           // Optionnel: déclencher une action si une nouvelle phrase NMEA complète est reçue
+       }
+    }
+    // Petit délai pour éviter de monopoliser le CPU si rien d'autre
+    delay(5);
+}
+
+// =========================================================================
+// FONCTIONS D'INITIALISATION
+// =========================================================================
+void setupSensors() {
+    // GPS sur UART2 Hardware (Pins 16, 17)
+    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    Serial.println("E3: GPS Serial (UART2 HW) initialisé sur RX=" + String(GPS_RX_PIN) + ", TX=" + String(GPS_TX_PIN));
+
+    // Capteur de lumière I2C
+    if (als.begin()) {
+        Serial.println("E3: Capteur VEML7700 initialisé.");
+        // Optionnel: Configurer le capteur si nécessaire (gain, temps intégration)
+        // als.setGain(VEML7700_GAIN_1_8);
+        // als.setIntegrationTime(VEML7700_IT_25MS);
+    } else {
+        Serial.println("E3 ERREUR: VEML7700 non trouvé !");
+    }
+}
+
+void setupLCD() {
+    lcd.begin(16, 2); // Initialisation standard pour LCD I2C 16x2
+    lcd.setRGB(0, 128, 128); // Couleur de fond par défaut (bleu-vert)
+    Serial.println("E3: LCD initialisé.");
+}
+
+void setupUARTs() {
+    // UART1 pour communiquer avec E1 (RX=26, TX=25)
+    Serial_E1.begin(115200, SERIAL_8N1, E3_RX_FROM_E1_PIN, E3_TX_TO_E1_PIN);
+    Serial.println("E3: UART1 (vers/depuis E1) initialisé sur RX=" + String(E3_RX_FROM_E1_PIN) + ", TX=" + String(E3_TX_TO_E1_PIN));
+
+    // UART0 pour communiquer avec E2 (RX=15, TX=13)
+    Serial_E2.begin(115200, SERIAL_8N1, E3_RX_FROM_E2_PIN, E3_TX_TO_E2_PIN);
+    Serial.println("E3: UART0 (vers/depuis E2) initialisé sur RX=" + String(E3_RX_FROM_E2_PIN) + ", TX=" + String(E3_TX_TO_E2_PIN));
+    delay(100);
+}
+
+// =========================================================================
+// FONCTIONS DE LECTURE, ENVOI, AFFICHAGE
+// =========================================================================
+void readSensors() {
+    // Lecture Lumière
+    if (als.getALSLux(current_lux) != 0) { // Vérifier si la lecture a réussi
+       // Erreur lecture Lux, garder l'ancienne valeur ou mettre -1?
+       // current_lux = -1.0; // Option: indiquer explicitement l'erreur
+       // Serial.println("E3: Erreur lecture Lux");
+    }
+
+    // Les données GPS sont mises à jour par gps.encode() dans la loop principale
+    // Ici on met juste à jour nos variables globales si la position est valide
+    if (gps.location.isUpdated()) { // Vérifie si une nouvelle position a été calculée
+        if(gps.location.isValid()){
+           current_lat = gps.location.lat();
+           current_lon = gps.location.lng();
+           current_fix = true;
+        } else {
+           current_fix = false;
         }
     }
-
-    // Lecture de la luminosité
-    float lux;
-    als.getALSLux(lux);
-
-    // Affichage des données GPS et de la lumière
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    if (gps.location.isUpdated()) {
-        lcd.print("Lat:");
-        lcd.print(gps.location.lat(), 6);
-        lcd.setCursor(0, 1);
-        lcd.print("Long:");
-        lcd.print(gps.location.lng(), 6);
+     // Mettre à jour le statut du fix même si la position n'a pas changé depuis la dernière lecture
+    if (millis() > 5000 && gps.charsProcessed() < 10) { // Si après 5s, peu de data GPS -> probable pas de fix
+        //Serial.println(F("E3: No GPS data detected: check wiring."));
+        current_fix = false;
     } else {
-        lcd.print("No GPS Fix");
+        current_fix = gps.location.isValid();
     }
-    delay(2000);
+}
 
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Lux: ");
-    lcd.print(lux);
-    delay(2000);
+void sendDataToPeers() {
+    // Format: E3:LUX=val,LAT=val,LON=val,FIX=0ou1
+    String dataToSend = "E3:LUX=" + String(current_lux, 0);
+    dataToSend += ",LAT=" + String(current_lat, 6);
+    dataToSend += ",LON=" + String(current_lon, 6);
+    dataToSend += ",FIX=" + String(current_fix ? 1 : 0);
+
+    // Envoyer à E1 via Serial_E1 (UART1 mappé)
+    Serial_E1.println(dataToSend);
+    // Envoyer à E2 via Serial_E2 (UART0 mappé)
+    Serial_E2.println(dataToSend);
+
+    Serial.println("E3: Envoyé aux pairs: " + dataToSend); // Debug sur moniteur USB
+}
+
+// Affichage LCD alterné
+unsigned long lastLcdUpdate = 0;
+bool showGps = true;
+#define LCD_UPDATE_INTERVAL 3000 // Changer toutes les 3 secondes
+
+void displayDataLCD() {
+     unsigned long currentMillis = millis();
+     if (currentMillis - lastLcdUpdate > LCD_UPDATE_INTERVAL) {
+         lastLcdUpdate = currentMillis;
+         showGps = !showGps;
+         lcd.clear();
+
+         if (showGps) {
+             lcd.setCursor(0, 0);
+             if (current_fix) {
+                 // Afficher Lat/Lon sur deux lignes
+                 lcd.print("Lat:"); lcd.print(current_lat, 4); // Moins de décimales
+                 lcd.setCursor(0, 1);
+                 lcd.print("Lon:"); lcd.print(current_lon, 4);
+             } else {
+                 lcd.print("GPS: Recherche");
+                 lcd.setCursor(0, 1);
+                 lcd.print("Satellites: "); lcd.print(gps.satellites.value());
+             }
+         } else {
+             lcd.setCursor(0, 0);
+             lcd.print("Lumiere (Lux)");
+             lcd.setCursor(0, 1);
+             if (current_lux < 0) lcd.print("Erreur Lux");
+             else lcd.print(current_lux, 0);
+         }
+     }
+}
+
+// Optionnel: Lire les messages entrants (pour voir les "Hi")
+void checkIncomingMessages() {
+    String msg;
+    if (Serial_E1.available()) {
+        msg = Serial_E1.readStringUntil('\n');
+        msg.trim();
+        Serial.println("E3: Reçu de E1 (UART1): " + msg);
+        // On pourrait changer la couleur du LCD ou afficher un indicateur
+        // lcd.setRGB(0, 255, 0); delay(100); lcd.setRGB(0, 128, 128);
+    }
+    if (Serial_E2.available()) {
+        msg = Serial_E2.readStringUntil('\n');
+        msg.trim();
+        Serial.println("E3: Reçu de E2 (UART0): " + msg);
+        // lcd.setRGB(0, 0, 255); delay(100); lcd.setRGB(0, 128, 128);
+    }
 }
