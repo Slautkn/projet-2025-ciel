@@ -1,0 +1,68 @@
+GPS + LIGHT SENSOR
+
+
+
+
+
+#include <TinyGPSPlus.h> // Bibliothèque pour parser les données GPS
+#include <Wire.h>       // Bibliothèque pour la communication I2C
+#include "rgb_lcd.h"    // Bibliothèque pour l'écran LCD RGB
+#include "DFRobot_VEML7700.h"  // Bibliothèque pour le capteur de lumière VEML7700
+
+// Définition des pins RX et TX pour la communication série 2
+#define RXD2 16
+#define TXD2 17
+
+// Vitesse de communication série (bauds)
+#define GPS_BAUD 9600
+
+// Création d'objets pour les capteurs et l'affichage
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+rgb_lcd lcd;
+DFRobot_VEML7700 als;
+
+void setup() {
+    Serial.begin(115200);  // Moniteur série
+    gpsSerial.begin(GPS_BAUD, SERIAL_8N1, RXD2, TXD2); // GPS
+    lcd.begin(16, 2);  // LCD
+    als.begin();  // Capteur de lumière
+
+    lcd.print("Initializing...");
+    delay(1000);
+    lcd.clear();
+}
+
+void loop() {
+    // Lecture des données GPS
+    unsigned long start = millis();
+    while (millis() - start < 1000) {
+        while (gpsSerial.available() > 0) {
+            gps.encode(gpsSerial.read());
+        }
+    }
+
+    // Lecture de la luminosité
+    float lux;
+    als.getALSLux(lux);
+
+    // Affichage des données GPS et de la lumière
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    if (gps.location.isUpdated()) {
+        lcd.print("Lat:");
+        lcd.print(gps.location.lat(), 6);
+        lcd.setCursor(0, 1);
+        lcd.print("Long:");
+        lcd.print(gps.location.lng(), 6);
+    } else {
+        lcd.print("No GPS Fix");
+    }
+    delay(2000);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Lux: ");
+    lcd.print(lux);
+    delay(2000);
+}
