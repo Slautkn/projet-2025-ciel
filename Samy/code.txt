@@ -1,191 +1,308 @@
+/**************************************************************************
+ * CODE POUR ELEVE 2
+ * - Capteurs Locaux: Horloge RTC DS3231 (I2C)
+ * - Affichage: Serveur Web en mode Access Point
+ * - Communication:
+ *   - Reçoit Temp/Batt de E1 via UART1 (Pins 14, 27)
+ *   - Reçoit Lux/GPS de E3 via UART2 (Pins 18, 19)
+ *   - Envoie RTC à E1 via UART1 (Pins 14, 27)
+ *   - Moniteur Série USB FONCTIONNEL pour le debug
+ **************************************************************************/
+
+#include <HardwareSerial.h> // Pour Serial1 et Serial2
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Wire.h>
+#include <RTClib.h>
 
-// Paramètres de configuration
-const char* ssid = "ESP32-Sensors";
-const char* password = "12345678";
+// --- Configuration WiFi AP ---
+const char* ssid = "ESP32_Eleve2_AP";
+const char* password = "passwordE2"; // Mot de passe simple
 
-// Pins de configuration
-const int buttonPin = 26;
-const int ledPin = 14;
-const int potPin = 4;  // Repasser au pin 4 comme demandé
-const int srf02Address = 0x70;  // Adresse I2C typique du capteur SRF02
+// --- Pins UART Inter-ESP (Basé sur discussion et pins libres révisées) ---
+#define E2_RX_FROM_E1_PIN 14 // UART1 RX <-- E1 TX0 (1)
+#define E2_TX_TO_E1_PIN   27 // UART1 TX --> E1 RX0 (3)
+#define E2_RX_FROM_E3_PIN 18 // UART2 RX <-- E3 TX0 (13)
+#define E2_TX_TO_E3_PIN   19 // UART2 TX --> E3 RX0 (15)
 
-// Création du serveur web
+// --- Objets Globaux ---
 WebServer server(80);
+RTC_DS3231 rtc;
+HardwareSerial Serial_E1(1); // Utiliser UART1 pour E1
+HardwareSerial Serial_E3(2); // Utiliser UART2 pour E3
 
-// Variables globales pour stocker les états des capteurs
-int lastButtonState = HIGH;
-int ledState = LOW;
-int potValue = 0;
-int distance = 0;
+// --- Variables Globales ---
+// Données locales (RTC)
+String local_time = "--:--:--";
+String local_date = "--/--/----";
+// Données reçues de E1 (Temp/Batt)
+float e1_temp = -99.9;
+int   e1_batt = -1;
+// Données reçues de E3 (Light/GPS)
+float e3_lux = -1.0;
+float e3_lat = 0.0;
+float e3_lon = 0.0;
+bool  e3_gps_fix = false;
 
+unsigned long lastRTCSend = 0;
+#define RTC_SEND_INTERVAL 1000 // Envoyer données RTC toutes les secondes
+
+// --- Prototypes ---
+void setupRTC();
+void setupWiFiAP();
+void setupWebServer();
+void setupUARTs(); // Modifié
+void handleRoot();
+void handleAllData();
+void receiveAndProcessData(); // Modifié
+void parseDataFromE1(String data);
+void parseDataFromE3(String data);
+void sendDataToE1(); // Modifié
+
+// =========================================================================
+// SETUP
+// =========================================================================
 void setup() {
-  // Initialisation des pins
-  pinMode(buttonPin, INPUT_PULLUP);
-  pinMode(ledPin, OUTPUT);
-  
-  // Configuration du potentiomètre
-  pinMode(potPin, INPUT);
+  Serial.begin(115200); // Moniteur série USB pour E2 (OK)
+  Serial.println(F("E2: Démarrage ESP32..."));
 
-  // Configuration de l'ADC
-  analogReadResolution(10);  // Configurer la résolution à 10 bits (0-1023)
-  
-  // Configuration de l'atténuation pour une plage de lecture plus large
-  analogSetAttenuation(ADC_0db);  // Atténuation par défaut
+  Wire.begin(); // Pour RTC
 
-  // Initialisation de la communication série
-  Serial.begin(115200);
+  setupRTC();
+  setupUARTs(); // Initialise UART1 et UART2
+  setupWiFiAP();
+  setupWebServer();
 
-  // Initialisation de la communication I2C
-  Wire.begin();
-
-  // Configuration du point d'accès WiFi
-  WiFi.softAP(ssid, password);
-  IPAddress IP = WiFi.softAPIP();
-  Serial.print("Adresse IP du point d'accès : ");
-  Serial.println(IP);
-
-  // Configuration des routes du serveur web
-  server.on("/", handleRoot);
-  server.on("/toggle-led", handleToggleLED);
-  server.on("/sensor-data", handleSensorData);
-
-  // Démarrage du serveur
-  server.begin();
-  Serial.println("Serveur web démarré");
+  Serial.println(F("E2: Configuration terminée. Serveur web démarré."));
 }
 
+// =========================================================================
+// LOOP
+// =========================================================================
 void loop() {
-  // Gestion des requêtes client
+  unsigned long currentMillis = millis();
+
+  // Gérer les requêtes web
   server.handleClient();
 
-  // Mise à jour des valeurs de capteurs
-  updateSensorValues();
+  // Lire les données série entrantes
+  receiveAndProcessData();
 
-  // Petite pause pour stabiliser les lectures
+  // Lire l'heure locale et envoyer à E1 périodiquement
+  if (currentMillis - lastRTCSend >= RTC_SEND_INTERVAL) {
+    lastRTCSend = currentMillis;
+    DateTime now = rtc.now(); // Lire l'heure locale
+    // Formatage avec zéros initiaux si nécessaire
+    char timeBuf[9]; // HH:MM:SS\0
+    char dateBuf[11]; // DD/MM/YYYY\0
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", now.day(), now.month(), now.year());
+    local_time = String(timeBuf);
+    local_date = String(dateBuf);
+
+    sendDataToE1(); // Envoyer l'heure à E1
+  }
+  // Pas besoin de delay ici, server.handleClient() est non bloquant
+}
+
+// =========================================================================
+// FONCTIONS D'INITIALISATION (SETUP)
+// =========================================================================
+void setupRTC() {
+  if (!rtc.begin()){ Serial.println("E2 ERREUR: RTC non trouvé !"); while(1); }
+  if (rtc.lostPower()){
+    Serial.println("E2: RTC perdu alim. Réglage heure compil.");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+   Serial.println("E2: RTC initialisé.");
+   // Lecture initiale pour avoir des valeurs par défaut
+   DateTime now = rtc.now();
+   char timeBuf[9]; char dateBuf[11];
+   snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+   snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", now.day(), now.month(), now.year());
+   local_time = String(timeBuf); local_date = String(dateBuf);
+}
+
+void setupUARTs() {
+  // UART1 pour communiquer avec E1 (RX=14, TX=27)
+  Serial_E1.begin(115200, SERIAL_8N1, E2_RX_FROM_E1_PIN, E2_TX_TO_E1_PIN);
+  Serial.println("E2: UART1 (vers/depuis E1) initialisé sur RX=" + String(E2_RX_FROM_E1_PIN) + ", TX=" + String(E2_TX_TO_E1_PIN));
+
+  // UART2 pour communiquer avec E3 (RX=18, TX=19)
+  Serial_E3.begin(115200, SERIAL_8N1, E2_RX_FROM_E3_PIN, E2_TX_TO_E3_PIN);
+  Serial.println("E2: UART2 (vers/depuis E3) initialisé sur RX=" + String(E2_RX_FROM_E3_PIN) + ", TX=" + String(E2_TX_TO_E3_PIN));
   delay(100);
 }
 
-void updateSensorValues() {
-  // Lecture de l'état du bouton
-  int currentButtonState = digitalRead(buttonPin);
-  
-  // Vérification du changement d'état du bouton
-  if (currentButtonState == LOW && lastButtonState == HIGH) {
-    // Bouton appuyé, basculer l'état de la LED
-    ledState = !ledState;
-    digitalWrite(ledPin, ledState);
-    
-    // Petit délai anti-rebond
-    delay(50);
-  }
-  
-  // Mettre à jour l'état du dernier bouton
-  lastButtonState = currentButtonState;
-
-  // Lecture de la valeur du potentiomètre avec diagnostic
-  potValue = analogRead(potPin);
-  
-  // Debug : afficher la valeur du potentiomètre dans le moniteur série
-  Serial.print("Valeur du potentiomètre : ");
-  Serial.println(potValue);
-
-  // Lecture de la distance avec le capteur SRF02
-  distance = readSRF02Distance();
+void setupWiFiAP() {
+  WiFi.softAP(ssid, password);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("E2: Adresse IP AP : "); Serial.println(IP);
 }
 
-int readSRF02Distance() {
-  // Commande pour lire la distance (démarrer une mesure et lire le résultat)
-  Wire.beginTransmission(srf02Address);
-  Wire.write(0x00);  // Registre de commande
-  Wire.write(0x51);  // Commande de mesure de distance en centimètres
-  Wire.endTransmission();
-
-  // Petit délai pour la mesure
-  delay(70);
-
-  // Lire les données de distance
-  Wire.beginTransmission(srf02Address);
-  Wire.write(0x02);  // Registre des données de distance haute
-  Wire.endTransmission();
-
-  // Demander 2 octets (distance sur 16 bits)
-  Wire.requestFrom(srf02Address, 2);
-
-  if (Wire.available() >= 2) {
-    int highByte = Wire.read();
-    int lowByte = Wire.read();
-    return (highByte << 8) | lowByte;
-  }
-  
-  return 0;
+void setupWebServer() {
+  server.on("/", HTTP_GET, handleRoot); // Spécifier HTTP_GET est une bonne pratique
+  server.on("/all-data", HTTP_GET, handleAllData); // Route JSON
+  server.onNotFound([](){ server.send(404, "text/plain", "Not found"); }); // Gérer 404
+  server.begin();
+  Serial.println("E2: Serveur web démarré");
 }
 
+// =========================================================================
+// FONCTIONS DE COMMUNICATION ET TRAITEMENT
+// =========================================================================
+void receiveAndProcessData() {
+  String receivedData;
+  // Données de E1 via UART1
+  if (Serial_E1.available()) {
+    receivedData = Serial_E1.readStringUntil('\n');
+    receivedData.trim();
+    if (receivedData.startsWith("E1:")) {
+      Serial.println("E2: Reçu de E1: " + receivedData); // Debug
+      parseDataFromE1(receivedData);
+    } else {
+      Serial.println("E2: Reçu INCONNU de UART1: " + receivedData);
+    }
+  }
+  // Données de E3 via UART2
+  if (Serial_E3.available()) {
+    receivedData = Serial_E3.readStringUntil('\n');
+    receivedData.trim();
+    if (receivedData.startsWith("E3:")) {
+      Serial.println("E2: Reçu de E3: " + receivedData); // Debug
+      parseDataFromE3(receivedData);
+    } else {
+       Serial.println("E2: Reçu INCONNU de UART2: " + receivedData);
+    }
+  }
+}
+
+void parseDataFromE1(String data) {
+  // Format: E1:TEMP=val,BATT=val
+  int tempIndex = data.indexOf("TEMP=");
+  int battIndex = data.indexOf("BATT=");
+   if (tempIndex != -1 && battIndex != -1) {
+      String tempStr = data.substring(tempIndex + 5, data.indexOf(',', tempIndex));
+      String battStr = data.substring(battIndex + 5);
+      e1_temp = tempStr.toFloat();
+      e1_batt = battStr.toInt();
+   } else {
+      Serial.println("E2: Format données E1 invalide: " + data);
+   }
+}
+
+void parseDataFromE3(String data) {
+   // Format: E3:LUX=val,LAT=val,LON=val,FIX=0ou1
+    int luxIndex = data.indexOf("LUX=");
+    int latIndex = data.indexOf("LAT=");
+    int lonIndex = data.indexOf("LON=");
+    int fixIndex = data.indexOf("FIX=");
+    if (luxIndex != -1 && latIndex != -1 && lonIndex != -1 && fixIndex != -1) {
+      String luxStr = data.substring(luxIndex + 4, data.indexOf(',', luxIndex));
+      String latStr = data.substring(latIndex + 4, data.indexOf(',', latIndex));
+      String lonStr = data.substring(lonIndex + 4, data.indexOf(',', lonIndex));
+      String fixStr = data.substring(fixIndex + 4);
+      e3_lux = luxStr.toFloat();
+      e3_lat = latStr.toFloat();
+      e3_lon = lonStr.toFloat();
+      e3_gps_fix = (fixStr.toInt() == 1);
+    } else {
+      Serial.println("E2: Format données E3 invalide: " + data);
+    }
+}
+
+// Envoyer les données RTC locales à E1 via UART1
+void sendDataToE1() {
+    String dataToSend = "E2:TIME=" + local_time + ",DATE=" + local_date;
+    Serial_E1.println(dataToSend);
+    // Serial.println("E2: Envoyé à E1: " + dataToSend); // Debug si besoin
+}
+
+// =========================================================================
+// GESTIONNAIRES DU SERVEUR WEB
+// =========================================================================
 void handleRoot() {
+  // HTML amélioré pour afficher toutes les données
   String html = R"(
 <!DOCTYPE html>
-<html>
+<html lang='fr'>
 <head>
-  <title>Capteurs ESP32</title>
-  <meta charset='UTF-8'>
+  <title>Données Projet Multi-ESP</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="5">
   <style>
-    body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-    .sensor-data { background: #f4f4f4; padding: 10px; margin: 10px 0; border-radius: 5px; }
-    .button { background-color: #4CAF50; color: white; padding: 10px 20px; text-decoration: none; display: inline-block; margin: 10px 0; }
+    body { font-family: Arial, Helvetica, sans-serif; max-width: 800px; margin: 20px auto; padding: 15px; background-color: #eef; color: #333; }
+    h1 { color: #003366; text-align: center; border-bottom: 2px solid #99aabb; padding-bottom: 10px; }
+    .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+    .card { background-color: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); transition: transform 0.2s; }
+    .card:hover { transform: translateY(-5px); }
+    .card h2 { margin-top: 0; color: #0055a4; border-bottom: 1px solid #dde; padding-bottom: 8px; font-size: 1.1em; }
+    .data-item { margin-bottom: 10px; font-size: 0.95em; }
+    .label { font-weight: bold; color: #555; min-width: 110px; display: inline-block; }
+    .value { color: #111; }
+    .value.gps-ok { color: green; }
+    .value.gps-no { color: orange; }
+    .value.error { color: red; font-style: italic;}
+    @media (max-width: 600px) { .grid-container { grid-template-columns: 1fr; } h1 { font-size: 1.5em; } }
   </style>
 </head>
 <body>
-  <h1>Tableau de Bord des Capteurs ESP32</h1>
-  <div id='sensorData' class='sensor-data'>
-    <p>Chargement des données...</p>
-  </div>
-  <a href='/toggle-led' class='button'>Basculer LED</a>
-  <script>
-    function updateSensorData() {
-      fetch('/sensor-data')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('sensorData').innerHTML = `
-            <h2>Données en temps réel :</h2>
-            <p>État du bouton : ${data.buttonState ? 'Relâché' : 'Appuyé'}</p>
-            <p>État de la LED : ${data.ledState ? 'Allumée' : 'Éteinte'}</p>
-            <p>Valeur du potentiomètre : ${data.potValue}</p>
-            <p>Distance du capteur SRF02 : ${data.distance} cm</p>
-          `;
-        });
-    }
-    
-    // Mettre à jour les données toutes les secondes
-    setInterval(updateSensorData, 1000);
-    updateSensorData();
-  </script>
+  <h1>Tableau de Bord - Projet Multi-ESP (E2)</h1>
+  <div class="grid-container">
+)";
+
+  // Section Données Locales (E2 - RTC)
+  html += R"(
+    <div class="card">
+      <h2>Données Locales (E2 - RTC)</h2>
+      <div class="data-item"><span class="label">Date:</span> <span class="value">)" + local_date + R"(</span></div>
+      <div class="data-item"><span class="label">Heure:</span> <span class="value">)" + local_time + R"(</span></div>
+    </div>
+)";
+
+  // Section Données E1 (Temp/Batt)
+  html += R"(
+    <div class="card">
+      <h2>Données Reçues de E1</h2>
+      <div class="data-item"><span class="label">Température:</span> <span class="value )" + (e1_temp <= -99.0 ? "error" : "") + R"(">)" + (e1_temp <= -99.0 ? "N/A" : String(e1_temp, 1) + " °C") + R"(</span></div>
+      <div class="data-item"><span class="label">Batterie:</span> <span class="value )" + (e1_batt < 0 ? "error" : "") + R"(">)" + (e1_batt < 0 ? "N/A" : String(e1_batt) + " %") + R"(</span></div>
+    </div>
+)";
+
+  // Section Données E3 (Light/GPS)
+   html += R"(
+    <div class="card">
+      <h2>Données Reçues de E3</h2>
+      <div class="data-item"><span class="label">Luminosité:</span> <span class="value )" + (e3_lux < 0 ? "error" : "") + R"(">)" + (e3_lux < 0 ? "N/A" : String(e3_lux, 0) + " Lux") + R"(</span></div>
+      <div class="data-item"><span class="label">GPS Fix:</span> <span class="value )" + (e3_gps_fix ? "gps-ok" : "gps-no") + R"(">)" + (e3_gps_fix ? "Oui" : "Non") + R"(</span></div>
+      <div class="data-item"><span class="label">Latitude:</span> <span class="value">)" + (e3_gps_fix ? String(e3_lat, 6) : "---") + R"(</span></div>
+      <div class="data-item"><span class="label">Longitude:</span> <span class="value">)" + (e3_gps_fix ? String(e3_lon, 6) : "---") + R"(</span></div>
+    </div>
+)";
+
+  html += R"(
+  </div> <!-- grid-container -->
 </body>
 </html>
   )";
-  
   server.send(200, "text/html", html);
 }
 
-void handleToggleLED() {
-  // Basculer l'état de la LED
-  ledState = !ledState;
-  digitalWrite(ledPin, ledState);
-  
-  // Rediriger vers la page principale
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
-void handleSensorData() {
-  // Créer un objet JSON avec les données des capteurs
-  String jsonResponse = "{";
-  jsonResponse += "\"buttonState\":" + String(digitalRead(buttonPin));
-  jsonResponse += ",\"ledState\":" + String(ledState);
-  jsonResponse += ",\"potValue\":" + String(potValue);
-  jsonResponse += ",\"distance\":" + String(distance);
-  jsonResponse += "}";
-  
-  server.send(200, "application/json", jsonResponse);
+// Route JSON (pourrait être utilisée par Javascript)
+void handleAllData() {
+  String json = "{";
+  // E2 Data
+  json += "\"e2_time\":\"" + local_time + "\",";
+  json += "\"e2_date\":\"" + local_date + "\",";
+  // E1 Data
+  json += "\"e1_temp\":" + String(e1_temp, 1) + ",";
+  json += "\"e1_batt\":" + String(e1_batt) + ",";
+  // E3 Data
+  json += "\"e3_lux\":" + String(e3_lux, 0) + ",";
+  json += "\"e3_lat\":" + String(e3_lat, 6) + ",";
+  json += "\"e3_lon\":" + String(e3_lon, 6) + ",";
+  json += "\"e3_fix\":" + String(e3_gps_fix ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
 }
