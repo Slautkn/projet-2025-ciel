@@ -1,73 +1,399 @@
-TEST DU Gravity + LED
+/**************************************************************************
+ * CODE POUR ELEVE 2 (Modifié pour contrôle LEDs basé sur E3 Lux)
+ * - Capteurs Locaux: Horloge RTC DS3231 (I2C)
+ * - Actionneur: Bande de LEDs WS2813 (contrôlée par E3 Lux)
+ * - Affichage: Serveur Web en mode Access Point
+ * - Communication:
+ *   - Reçoit Temp/Batt de E1 via UART1 (Pins 14, 27)
+ *   - Reçoit Lux/GPS de E3 via UART2 (Pins 18, 19) -> **Utilise Lux pour LEDs**
+ *   - Envoie RTC à E1 via UART1 (Pins 14, 27)
+ *   - Moniteur Série USB FONCTIONNEL pour le debug
+ **************************************************************************/
 
+#include <HardwareSerial.h> // Pour Serial1 et Serial2
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <FastLED.h>          // *** NOUVEAU: Bibliothèque pour contrôler les LEDs ***
 
+// --- Configuration WiFi AP ---
+const char* ssid = "ESP32_Eleve2_AP";
+const char* password = "passwordE2";
 
-#include "DFRobot_VEML7700.h" // Bibliothèque pour le capteur de luminosité VEML7700
-#include <FastLED.h>          // Bibliothèque pour contrôler les LEDs
-#include <Wire.h>             // Bibliothèque Wire pour la communication I2C
-
-// Configuration des LEDs
+// --- Configuration LEDs ---
 #define NUM_LEDS 30      // Nombre total de LEDs dans la bande
-#define DATA_PIN 23      // Broche de données pour les LEDs
-#define CLOCK_PIN 18     // Broche d'horloge (non utilisée dans la configuration actuelle)
+#define DATA_PIN 23      // Broche de données pour les LEDs (Vérifier disponibilité pin 23)
+#define LED_TYPE WS2813  // Type de LED (ex: WS2812B, WS2813, NEOPIXEL)
+#define COLOR_ORDER RGB  // Ordre des couleurs (ex: GRB, RGB)
+#define BRIGHTNESS 96    // Luminosité max (0-255)
 
-// Seuil de luminosité qui déclenchera l'allumage des LEDs (ajuster selon vos besoins)
-#define LUMINOSITY_THRESHOLD 50.0  // en lux
+// --- Seuil de luminosité pour contrôler les LEDs (basé sur E3) ---
+#define LUMINOSITY_THRESHOLD 50.0  // en lux (valeur reçue de E3)
 
-// Création des objets
-DFRobot_VEML7700 als;    // Objet pour le capteur de luminosité
-CRGB leds[NUM_LEDS];     // Tableau pour les LEDs
+// --- Pins UART Inter-ESP ---
+#define E2_RX_FROM_E1_PIN 14 // UART1 RX <-- E1 TX0 (1)
+#define E2_TX_TO_E1_PIN   27 // UART1 TX --> E1 RX0 (3)
+#define E2_RX_FROM_E3_PIN 18 // UART2 RX <-- E3 TX0 (13)
+#define E2_TX_TO_E3_PIN   19 // UART2 TX --> E3 RX0 (15)
 
+// --- Objets Globaux ---
+WebServer server(80);
+RTC_DS3231 rtc;
+HardwareSerial Serial_E1(1); // UART1 pour E1
+HardwareSerial Serial_E3(2); // UART2 pour E3
+CRGB leds[NUM_LEDS];         // *** NOUVEAU: Tableau pour les LEDs ***
+
+// --- Variables Globales ---
+// Données locales (RTC)
+String local_time = "--:--:--";
+String local_date = "--/--/----";
+// Données reçues de E1 (Temp/Batt)
+float e1_temp = -99.9;
+int   e1_batt = -1;
+// Données reçues de E3 (Light/GPS)
+float e3_lux = -1.0; // Initialisé à une valeur invalide
+float e3_lat = 0.0;
+float e3_lon = 0.0;
+bool  e3_gps_fix = false;
+// État des LEDs
+bool ledsAreOn = false;      // *** NOUVEAU: Suivi de l'état des LEDs ***
+
+unsigned long lastRTCSend = 0;
+#define RTC_SEND_INTERVAL 1000 // Envoyer données RTC toutes les secondes
+
+// --- Prototypes ---
+void setupRTC();
+void setupWiFiAP();
+void setupWebServer();
+void setupUARTs();
+void setupLEDs();            // *** NOUVEAU: Initialisation LEDs ***
+void handleRoot();           // Modifié
+void handleAllData();        // Modifié
+void receiveAndProcessData();
+void parseDataFromE1(String data);
+void parseDataFromE3(String data);
+void sendDataToE1();
+void controlLEDs();          // *** NOUVEAU: Logique de contrôle LEDs ***
+void fillLedPattern();       // *** NOUVEAU: Applique le motif R-G-B ***
+
+
+// =========================================================================
+// SETUP
+// =========================================================================
 void setup() {
-  // Initialisation de la communication série
-  Serial.begin(9600);
-  
-  // Initialisation du capteur de luminosité
-  als.begin();
-  
-  // Initialisation des LEDs
-  FastLED.addLeds<WS2813, DATA_PIN, RGB>(leds, NUM_LEDS);  // GRB ordering is assumed
-  
+  Serial.begin(115200);
+  Serial.println(F("E2: Démarrage ESP32 avec contrôle LEDs..."));
+
+  Wire.begin();
+
+  setupRTC();
+  setupUARTs();
+  setupLEDs();            // *** NOUVEAU: Initialiser les LEDs ***
+  setupWiFiAP();
+  setupWebServer();
+
+  Serial.println(F("E2: Configuration terminée. Serveur web démarré."));
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Gérer les requêtes web
+  server.handleClient();
+
+  // Lire les données série entrantes (met à jour e1_temp, e1_batt, e3_lux, e3_lat, etc.)
+  receiveAndProcessData();
+
+  // Contrôler les LEDs en fonction de la dernière valeur de e3_lux reçue
+  controlLEDs();          // *** NOUVEAU: Appel de la fonction de contrôle LEDs ***
+
+  // Lire l'heure locale et envoyer à E1 périodiquement
+  if (currentMillis - lastRTCSend >= RTC_SEND_INTERVAL) {
+    lastRTCSend = currentMillis;
+    DateTime now = rtc.now();
+    char timeBuf[9]; char dateBuf[11];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", now.day(), now.month(), now.year());
+    local_time = String(timeBuf); local_date = String(dateBuf);
+    sendDataToE1();
+  }
+}
+
+// =========================================================================
+// FONCTIONS D'INITIALISATION (SETUP)
+// =========================================================================
+void setupRTC() { /* ... (identique à la version précédente) ... */
+    if (!rtc.begin()){ Serial.println("E2 ERREUR: RTC non trouvé !"); while(1); }
+    if (rtc.lostPower()){
+        Serial.println("E2: RTC perdu alim. Réglage heure compil.");
+        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
+    Serial.println("E2: RTC initialisé.");
+    DateTime now = rtc.now();
+    char timeBuf[9]; char dateBuf[11];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d/%04d", now.day(), now.month(), now.year());
+    local_time = String(timeBuf); local_date = String(dateBuf);
+}
+
+void setupUARTs() { /* ... (identique à la version précédente) ... */
+    Serial_E1.begin(115200, SERIAL_8N1, E2_RX_FROM_E1_PIN, E2_TX_TO_E1_PIN);
+    Serial.println("E2: UART1 (vers/depuis E1) initialisé sur RX=" + String(E2_RX_FROM_E1_PIN) + ", TX=" + String(E2_TX_TO_E1_PIN));
+    Serial_E3.begin(115200, SERIAL_8N1, E2_RX_FROM_E3_PIN, E2_TX_TO_E3_PIN);
+    Serial.println("E2: UART2 (vers/depuis E3) initialisé sur RX=" + String(E2_RX_FROM_E3_PIN) + ", TX=" + String(E2_TX_TO_E3_PIN));
+    delay(100);
+}
+
+void setupWiFiAP() { /* ... (identique à la version précédente) ... */
+    WiFi.softAP(ssid, password);
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("E2: Adresse IP AP : "); Serial.println(IP);
+}
+
+void setupWebServer() { /* ... (identique à la version précédente) ... */
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/all-data", HTTP_GET, handleAllData);
+    server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
+    server.begin();
+    Serial.println("E2: Serveur web démarré");
+}
+
+void setupLEDs() { // *** NOUVELLE FONCTION ***
+  // Initialisation de FastLED
+  FastLED.addLeds<LED_TYPE, DATA_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalLEDStrip);
+  FastLED.setBrightness(BRIGHTNESS);
+
   // Éteindre toutes les LEDs au démarrage
   FastLED.clear();
   FastLED.show();
+  ledsAreOn = false; // S'assurer que l'état initial est correct
+  Serial.println("E2: LEDs initialisées sur Pin " + String(DATA_PIN));
 }
 
-void loop() {
-  // Lecture de la luminosité ambiante
-  float lux;
-  als.getALSLux(lux);
-  
-  // Affichage de la valeur de luminosité dans le moniteur série
-  Serial.print("Lux: ");
-  Serial.print(lux);
-  Serial.println(" lx");
-  
-  // Vérification si la luminosité est inférieure au seuil
-  if (lux < LUMINOSITY_THRESHOLD) {
-    // Si la luminosité est faible, allumer les LEDs
-    Serial.println("Luminosité faible - Allumage des LEDs");
-    
-    // Configurer toutes les LEDs avec le pattern rouge, bleu, vert
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (i % 3 == 0) {
-        leds[i] = CRGB::Red;    // LEDs aux positions 0, 3, 6, etc.
-      } else if (i % 3 == 1) {
-        leds[i] = CRGB::Blue;   // LEDs aux positions 1, 4, 7, etc.
-      } else {
-        leds[i] = CRGB::Green;  // LEDs aux positions 2, 5, 8, etc.
-      }
+// =========================================================================
+// FONCTIONS DE COMMUNICATION ET TRAITEMENT
+// =========================================================================
+void receiveAndProcessData() { /* ... (identique à la version précédente) ... */
+    String receivedData;
+    // Données de E1 via UART1
+    if (Serial_E1.available()) {
+        receivedData = Serial_E1.readStringUntil('\n');
+        receivedData.trim();
+        if (receivedData.startsWith("E1:")) {
+            Serial.println("E2: Reçu de E1: " + receivedData);
+            parseDataFromE1(receivedData);
+        } else {
+            Serial.println("E2: Reçu INCONNU de UART1: " + receivedData);
+        }
     }
-    
-    // Afficher toutes les LEDs en une seule fois
-    FastLED.show();
+    // Données de E3 via UART2
+    if (Serial_E3.available()) {
+        receivedData = Serial_E3.readStringUntil('\n');
+        receivedData.trim();
+        if (receivedData.startsWith("E3:")) {
+            Serial.println("E2: Reçu de E3: " + receivedData);
+            parseDataFromE3(receivedData); // Met à jour e3_lux, e3_lat, etc.
+        } else {
+            Serial.println("E2: Reçu INCONNU de UART2: " + receivedData);
+        }
+    }
+}
+
+void parseDataFromE1(String data) { /* ... (identique à la version précédente) ... */
+    int tempIndex = data.indexOf("TEMP=");
+    int battIndex = data.indexOf("BATT=");
+    if (tempIndex != -1 && battIndex != -1) {
+        String tempStr = data.substring(tempIndex + 5, data.indexOf(',', tempIndex));
+        String battStr = data.substring(battIndex + 5);
+        e1_temp = tempStr.toFloat();
+        e1_batt = battStr.toInt();
+    } else {
+        Serial.println("E2: Format données E1 invalide: " + data);
+    }
+}
+
+void parseDataFromE3(String data) { /* ... (identique à la version précédente) ... */
+    int luxIndex = data.indexOf("LUX=");
+    int latIndex = data.indexOf("LAT=");
+    int lonIndex = data.indexOf("LON=");
+    int fixIndex = data.indexOf("FIX=");
+    if (luxIndex != -1 && latIndex != -1 && lonIndex != -1 && fixIndex != -1) {
+        String luxStr = data.substring(luxIndex + 4, data.indexOf(',', luxIndex));
+        String latStr = data.substring(latIndex + 4, data.indexOf(',', latIndex));
+        String lonStr = data.substring(lonIndex + 4, data.indexOf(',', lonIndex));
+        String fixStr = data.substring(fixIndex + 4);
+        // Met à jour les variables globales
+        e3_lux = luxStr.toFloat();
+        e3_lat = latStr.toFloat();
+        e3_lon = lonStr.toFloat();
+        e3_gps_fix = (fixStr.toInt() == 1);
+    } else {
+        Serial.println("E2: Format données E3 invalide: " + data);
+        // Optionnel: remettre e3_lux à -1 en cas d'erreur de format ?
+        // e3_lux = -1.0;
+    }
+}
+
+void sendDataToE1() { /* ... (identique à la version précédente) ... */
+    String dataToSend = "E2:TIME=" + local_time + ",DATE=" + local_date;
+    Serial_E1.println(dataToSend);
+}
+
+// =========================================================================
+// FONCTIONS DE CONTROLE DES LEDS
+// =========================================================================
+
+void controlLEDs() { // *** NOUVELLE FONCTION ***
+  // Vérifier si la valeur de lux reçue est valide (pas -1.0)
+  if (e3_lux >= 0) {
+    // La valeur est valide, comparer au seuil
+    if (e3_lux < LUMINOSITY_THRESHOLD) {
+      // Luminosité faible -> Allumer les LEDs si elles sont éteintes
+      if (!ledsAreOn) {
+        Serial.println("E2: Luminosité E3 (" + String(e3_lux) + "lx) < Seuil (" + String(LUMINOSITY_THRESHOLD) + "lx) -> Allumage LEDs");
+        fillLedPattern(); // Appliquer le motif R-G-B
+        FastLED.show();   // Mettre à jour la bande de LEDs
+        ledsAreOn = true; // Mettre à jour l'état
+      }
+      // Si elles sont déjà allumées, ne rien faire (évite clignotement)
+    } else {
+      // Luminosité suffisante -> Éteindre les LEDs si elles sont allumées
+      if (ledsAreOn) {
+        Serial.println("E2: Luminosité E3 (" + String(e3_lux) + "lx) >= Seuil (" + String(LUMINOSITY_THRESHOLD) + "lx) -> Extinction LEDs");
+        FastLED.clear();  // Éteindre toutes les LEDs
+        FastLED.show();   // Mettre à jour la bande
+        ledsAreOn = false; // Mettre à jour l'état
+      }
+      // Si elles sont déjà éteintes, ne rien faire
+    }
   } else {
-    // Si la luminosité est suffisante, éteindre les LEDs
-    Serial.println("Luminosité suffisante - LEDs éteintes");
-    FastLED.clear();
-    FastLED.show();
+    // La valeur de lux reçue n'est pas valide (encore à -1.0 ou erreur)
+    // -> S'assurer que les LEDs sont éteintes par sécurité
+    if (ledsAreOn) {
+      Serial.println("E2: Valeur Lux E3 invalide -> Extinction LEDs par sécurité");
+      FastLED.clear();
+      FastLED.show();
+      ledsAreOn = false;
+    }
   }
-  
-  // Attendre avant la prochaine lecture
-  delay(200);
+}
+
+void fillLedPattern() { // *** NOUVELLE FONCTION ***
+  // Applique le motif Rouge, Vert, Bleu répétitif
+   for (int i = 0; i < NUM_LEDS; i++) {
+      switch(i % 3) {
+         case 0: leds[i] = CRGB::Red; break;
+         case 1: leds[i] = CRGB::Green; break; // Ordre RGB utilisé dans le code exemple
+         case 2: leds[i] = CRGB::Blue; break;
+      }
+   }
+   // Note: La luminosité globale est gérée par FastLED.setBrightness() dans setupLEDs()
+}
+
+
+// =========================================================================
+// GESTIONNAIRES DU SERVEUR WEB (Modifiés)
+// =========================================================================
+void handleRoot() {
+  // HTML amélioré pour inclure l'état des LEDs
+  String html = R"(
+<!DOCTYPE html>
+<html lang='fr'>
+<head>
+  <title>Données Projet Multi-ESP</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="refresh" content="5">
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; max-width: 800px; margin: 20px auto; padding: 15px; background-color: #eef; color: #333; }
+    h1 { color: #003366; text-align: center; border-bottom: 2px solid #99aabb; padding-bottom: 10px; }
+    .grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+    .card { background-color: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); transition: transform 0.2s; }
+    .card:hover { transform: translateY(-5px); }
+    .card h2 { margin-top: 0; color: #0055a4; border-bottom: 1px solid #dde; padding-bottom: 8px; font-size: 1.1em; }
+    .data-item { margin-bottom: 10px; font-size: 0.95em; }
+    .label { font-weight: bold; color: #555; min-width: 120px; display: inline-block; } /* Augmenté min-width */
+    .value { color: #111; }
+    .value.gps-ok { color: green; font-weight:bold; }
+    .value.gps-no { color: orange; font-weight:bold;}
+    .value.led-on { color: #228B22; font-weight:bold;} /* Vert Foncé */
+    .value.led-off { color: #DC143C; font-weight:bold;} /* Crimson */
+    .value.error { color: red; font-style: italic;}
+    @media (max-width: 600px) { .grid-container { grid-template-columns: 1fr; } h1 { font-size: 1.5em; } }
+  </style>
+</head>
+<body>
+  <h1>Tableau de Bord - Projet Multi-ESP (E2)</h1>
+  <div class="grid-container">
+)";
+
+  // Section Données Locales (E2 - RTC)
+  html += R"(
+    <div class="card">
+      <h2>Données Locales (E2 - RTC)</h2>
+      <div class="data-item"><span class="label">Date:</span> <span class="value">)" + local_date + R"(</span></div>
+      <div class="data-item"><span class="label">Heure:</span> <span class="value">)" + local_time + R"(</span></div>
+    </div>
+)";
+
+  // Section Données E1 (Temp/Batt)
+  html += R"(
+    <div class="card">
+      <h2>Données Reçues de E1</h2>
+      <div class="data-item"><span class="label">Température:</span> <span class="value )" + (e1_temp <= -99.0 ? "error" : "") + R"(">)" + (e1_temp <= -99.0 ? "N/A" : String(e1_temp, 1) + " °C") + R"(</span></div>
+      <div class="data-item"><span class="label">Batterie:</span> <span class="value )" + (e1_batt < 0 ? "error" : "") + R"(">)" + (e1_batt < 0 ? "N/A" : String(e1_batt) + " %") + R"(</span></div>
+    </div>
+)";
+
+  // Section Données E3 (Light/GPS)
+   html += R"(
+    <div class="card">
+      <h2>Données Reçues de E3</h2>
+      <div class="data-item"><span class="label">Luminosité (E3):</span> <span class="value )" + (e3_lux < 0 ? "error" : "") + R"(">)" + (e3_lux < 0 ? "N/A" : String(e3_lux, 0) + " Lux") + R"(</span></div>
+      <div class="data-item"><span class="label">GPS Fix:</span> <span class="value )" + (e3_gps_fix ? "gps-ok" : "gps-no") + R"(">)" + (e3_gps_fix ? "Oui" : "Non") + R"(</span></div>
+      <div class="data-item"><span class="label">Latitude:</span> <span class="value">)" + (e3_gps_fix ? String(e3_lat, 6) : "---") + R"(</span></div>
+      <div class="data-item"><span class="label">Longitude:</span> <span class="value">)" + (e3_gps_fix ? String(e3_lon, 6) : "---") + R"(</span></div>
+    </div>
+)";
+
+ // *** NOUVEAU: Section Contrôle LEDs ***
+ html += R"(
+    <div class="card">
+      <h2>Contrôle LEDs (Basé sur E3 Lux)</h2>
+      <div class="data-item"><span class="label">Seuil Activation:</span> <span class="value">< )" + String(LUMINOSITY_THRESHOLD, 0) + R"( Lux</span></div>
+      <div class="data-item"><span class="label">Luminosité E3:</span> <span class="value )" + (e3_lux < 0 ? "error" : "") + R"(">)" + (e3_lux < 0 ? "N/A" : String(e3_lux, 0) + " Lux") + R"(</span></div>
+      <div class="data-item"><span class="label">Statut LEDs:</span> <span class="value )" + (ledsAreOn ? "led-on" : "led-off") + R"(">)" + (ledsAreOn ? "ALLUMÉES" : "ÉTEINTES") + R"(</span></div>
+    </div>
+)";
+
+  html += R"(
+  </div> <!-- grid-container -->
+</body>
+</html>
+  )";
+  server.send(200, "text/html", html);
+}
+
+
+// Route JSON (modifiée pour inclure état LEDs)
+void handleAllData() {
+  String json = "{";
+  // E2 Data
+  json += "\"e2_time\":\"" + local_time + "\",";
+  json += "\"e2_date\":\"" + local_date + "\",";
+  json += "\"e2_led_status\":" + String(ledsAreOn ? 1 : 0) + ","; // *** NOUVEAU ***
+  // E1 Data
+  json += "\"e1_temp\":" + String(e1_temp, 1) + ",";
+  json += "\"e1_batt\":" + String(e1_batt) + ",";
+  // E3 Data
+  json += "\"e3_lux\":" + String(e3_lux, 0) + ",";
+  json += "\"e3_lat\":" + String(e3_lat, 6) + ",";
+  json += "\"e3_lon\":" + String(e3_lon, 6) + ",";
+  json += "\"e3_fix\":" + String(e3_gps_fix ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
 }
