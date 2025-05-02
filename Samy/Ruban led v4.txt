@@ -1,0 +1,43 @@
+
+
+
+#include <FastLED.h>
+
+// How many leds in your strip?
+#define NUM_LEDS 30
+
+// For led chipsets that are SPI based (four wires - data, clock,
+// ground, and power), like the LPD8806 define both DATA_PIN and CLOCK_PIN
+// Clock pin only needed for SPI based chipsets when not using hardware SPI
+#define DATA_PIN 23
+#define CLOCK_PIN 18
+
+// Define the array of leds
+CRGB leds[NUM_LEDS];
+
+void setup() { 
+    // Uncomment/edit one of the following lines for your leds arrangement.
+    // ## Clockless types ##
+    FastLED.addLeds<WS2813, DATA_PIN, RGB>(leds, NUM_LEDS);  // GRB ordering is assumed
+
+    // FastLED.addLeds<WS2813, DATA_PIN, RGB>(leds, NUM_LEDS);
+}
+
+void loop() {
+  // Configurer toutes les LEDs avec le pattern rouge, bleu, vert
+  for (int i = 0; i < 30; i++) {
+    if (i % 3 == 0) {
+      leds[i] = CRGB::Red;    // Tous les LEDs aux positions 0, 3, 6, etc.
+    } else if (i % 3 == 1) {
+      leds[i] = CRGB::Blue;   // Tous les LEDs aux positions 1, 4, 7, etc.
+    } else {
+      leds[i] = CRGB::Green;  // Tous les LEDs aux positions 2, 5, 8, etc.
+    }
+  }
+  
+  // Afficher toutes les LEDs en une seule fois
+  FastLED.show();
+  
+  // Attendre un peu avant de recommencer la boucle
+  delay(1000);
+}
