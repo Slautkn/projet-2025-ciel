@@ -1,0 +1,73 @@
+TEST DU Gravity + LED
+
+
+
+#include "DFRobot_VEML7700.h" // Bibliothèque pour le capteur de luminosité VEML7700
+#include <FastLED.h>          // Bibliothèque pour contrôler les LEDs
+#include <Wire.h>             // Bibliothèque Wire pour la communication I2C
+
+// Configuration des LEDs
+#define NUM_LEDS 30      // Nombre total de LEDs dans la bande
+#define DATA_PIN 23      // Broche de données pour les LEDs
+#define CLOCK_PIN 18     // Broche d'horloge (non utilisée dans la configuration actuelle)
+
+// Seuil de luminosité qui déclenchera l'allumage des LEDs (ajuster selon vos besoins)
+#define LUMINOSITY_THRESHOLD 50.0  // en lux
+
+// Création des objets
+DFRobot_VEML7700 als;    // Objet pour le capteur de luminosité
+CRGB leds[NUM_LEDS];     // Tableau pour les LEDs
+
+void setup() {
+  // Initialisation de la communication série
+  Serial.begin(9600);
+  
+  // Initialisation du capteur de luminosité
+  als.begin();
+  
+  // Initialisation des LEDs
+  FastLED.addLeds<WS2813, DATA_PIN, RGB>(leds, NUM_LEDS);  // GRB ordering is assumed
+  
+  // Éteindre toutes les LEDs au démarrage
+  FastLED.clear();
+  FastLED.show();
+}
+
+void loop() {
+  // Lecture de la luminosité ambiante
+  float lux;
+  als.getALSLux(lux);
+  
+  // Affichage de la valeur de luminosité dans le moniteur série
+  Serial.print("Lux: ");
+  Serial.print(lux);
+  Serial.println(" lx");
+  
+  // Vérification si la luminosité est inférieure au seuil
+  if (lux < LUMINOSITY_THRESHOLD) {
+    // Si la luminosité est faible, allumer les LEDs
+    Serial.println("Luminosité faible - Allumage des LEDs");
+    
+    // Configurer toutes les LEDs avec le pattern rouge, bleu, vert
+    for (int i = 0; i < NUM_LEDS; i++) {
+      if (i % 3 == 0) {
+        leds[i] = CRGB::Red;    // LEDs aux positions 0, 3, 6, etc.
+      } else if (i % 3 == 1) {
+        leds[i] = CRGB::Blue;   // LEDs aux positions 1, 4, 7, etc.
+      } else {
+        leds[i] = CRGB::Green;  // LEDs aux positions 2, 5, 8, etc.
+      }
+    }
+    
+    // Afficher toutes les LEDs en une seule fois
+    FastLED.show();
+  } else {
+    // Si la luminosité est suffisante, éteindre les LEDs
+    Serial.println("Luminosité suffisante - LEDs éteintes");
+    FastLED.clear();
+    FastLED.show();
+  }
+  
+  // Attendre avant la prochaine lecture
+  delay(200);
+}
