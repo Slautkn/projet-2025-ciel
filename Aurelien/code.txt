@@ -1,1 +1,396 @@
-salut
+/**************************************************************************
+ * CODE POUR ELEVE 1 (TOI)
+ * - Capteurs Locaux: BMP280 (Temp), Tension Batterie (ADC)
+ * - Affichage: Ecran TFT
+ * - Communication:
+ *   - Reçoit RTC de E2 via UART0 (Pins 1, 3) -> PERTE MONITEUR SERIE USB
+ *   - Reçoit Lux/GPS de E3 via UART1 (Pins 33, 32)
+ *   - Envoie Temp/Batt à E2 via UART0 (Pins 1, 3)
+ *   - Envoie TOUTES les données via Bluetooth
+ **************************************************************************/
+
+#include <HardwareSerial.h> // Pour utiliser Serial1/Serial2 explicitement
+#include <Wire.h>           // Pour I2C (BMP280)
+#include <TFT_eSPI.h>       // Pour l'écran TFT
+#include <SPI.h>            // Pour l'écran TFT (qui utilise SPI)
+#include <Adafruit_BMP280.h> // Pour le capteur de température/pression BMP280
+#include "BluetoothSerial.h" // Pour la communication Bluetooth
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled! Please run `make menuconfig` to enable it
+#endif
+
+// --- Configuration ---
+#define ANALOG_PIN 15       // Broche lecture tension (Vérifier si c'est bien celle utilisée)
+#define UPDATE_INTERVAL 1000 // Intervalle maj (ms)
+#define BT_NAME "ESP32_Eleve1" // Nom Bluetooth
+
+// Adresses I2C BMP280
+#define BMP280_ADDR_1 0x76
+#define BMP280_ADDR_2 0x77
+
+// Calibration Tension Batterie
+const float ADC_REFERENCE = 3.3;
+const float ADC_RESOLUTION = 4095.0;
+const float VOLTAGE_DIVIDER_RATIO = 14.0 / 3.0; // A ajuster si besoin
+const float BATTERY_MAX_VOLTAGE = 14.0;
+const float BATTERY_MIN_VOLTAGE = 10.5;
+
+// --- Pins UART Inter-ESP (Basé sur discussion et pins libres révisées) ---
+// ATTENTION: UART0 (Serial) est utilisé pour E2 -> Perte du moniteur USB
+#define E1_RX_FROM_E2_PIN 3  // UART0 RX <-- E2 TX1 (27)
+#define E1_TX_TO_E2_PIN   1  // UART0 TX --> E2 RX1 (14)
+#define E1_RX_FROM_E3_PIN 33 // UART1 RX <-- E3 TX1 (25)
+#define E1_TX_TO_E3_PIN   32 // UART1 TX --> E3 RX1 (26)
+
+// --- Objets Globaux ---
+TFT_eSPI tft = TFT_eSPI();
+Adafruit_BMP280 bmp;
+BluetoothSerial SerialBT;
+// UART0 (Serial) sera utilisé pour E2 - Pas besoin d'objet HardwareSerial séparé
+HardwareSerial Serial_E3(1); // Utiliser UART1 (mappé) pour E3
+
+// --- Variables Globales ---
+// Données locales
+float voltageADC = 0.0;
+float batteryVoltage = 0.0;
+int   batteryPercentage = 0;
+float temperature = -99.9; // Init avec valeur d'erreur
+// Données reçues de E2 (RTC)
+String e2_time = "--:--:--";
+String e2_date = "--/--/----";
+// Données reçues de E3 (Light/GPS)
+float e3_lux = -1.0;
+float e3_lat = 0.0;
+float e3_lon = 0.0;
+bool  e3_gps_fix = false;
+
+unsigned long lastUpdate = 0;
+
+// --- Prototypes ---
+void setupADC();
+void setupBMP280();
+void setupDisplay();
+void setupUARTs(); // Modifié
+void drawStaticUI();
+float readVoltage();
+float readTemperature();
+void receiveAndProcessData(); // Modifié
+void parseDataFromE2(String data);
+void parseDataFromE3(String data);
+void sendDataToE2(); // Modifié
+void updateDisplayData();
+void sendDataBluetooth();
+
+// =========================================================================
+// SETUP
+// =========================================================================
+void setup() {
+  // ATTENTION: Serial.begin initialise UART0 pour la communication avec E2
+  // Le moniteur série USB ne fonctionnera plus comme prévu !
+  // Utiliser un Baud rate commun: 115200
+  Serial.begin(115200, SERIAL_8N1, E1_RX_FROM_E2_PIN, E1_TX_TO_E2_PIN);
+  // Envoyer un message de démarrage via UART0 à E2
+  delay(500); // Donner un peu de temps à E2 pour démarrer
+  Serial.println("E1:Hi_E2"); // Message court pour E2
+
+  // --- Le reste du setup ne peut plus utiliser Serial.println pour le debug USB ---
+
+  Wire.begin(); // Init I2C pour BMP280
+
+  SerialBT.begin(BT_NAME); // Initialisation Bluetooth
+
+  setupADC();
+  setupBMP280();
+  setupUARTs();  // Initialise Serial_E3 (UART1 pour comm avec E3)
+  setupDisplay(); // Initialise l'écran TFT
+
+  // Afficher un message sur le TFT pour indiquer que c'est prêt
+  tft.setCursor(5, tft.height() - 10);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.print("E1 Pret (UART0->E2)");
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // Vérifier les données entrantes des autres ESP aussi souvent que possible
+  receiveAndProcessData();
+
+  // Mettre à jour les capteurs locaux, l'affichage et envoyer via BT/UART toutes les secondes
+  if (currentMillis - lastUpdate >= UPDATE_INTERVAL) {
+    lastUpdate = currentMillis;
+
+    // --- Lecture capteurs locaux ---
+    voltageADC = readVoltage();
+    temperature = readTemperature();
+
+    // --- Calculs locaux ---
+    batteryVoltage = voltageADC * VOLTAGE_DIVIDER_RATIO;
+    batteryPercentage = map(constrain(batteryVoltage * 100, BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100),
+                            BATTERY_MIN_VOLTAGE * 100, BATTERY_MAX_VOLTAGE * 100, 0, 100);
+
+    // --- Mise à jour et Envoi ---
+    updateDisplayData();    // Mettre à jour l'écran TFT
+    sendDataBluetooth();    // Envoyer toutes les données via Bluetooth
+    sendDataToE2();         // Envoyer Temp/Batt à E2 via UART0 (Serial)
+
+    // --- Debug Série Local (Impossible via USB) ---
+    // Alternative: Afficher un statut sur le TFT ou via Bluetooth
+  }
+}
+
+// =========================================================================
+// FONCTIONS D'INITIALISATION (SETUP)
+// =========================================================================
+void setupADC() {
+  analogSetWidth(12);
+  analogSetAttenuation(ADC_11db);
+  pinMode(ANALOG_PIN, INPUT);
+  // Serial.println(F("E1: ADC configuré.")); // DEBUG IMPOSSIBLE
+}
+
+void setupBMP280() {
+  unsigned status = bmp.begin(BMP280_ADDR_1);
+  if (!status) {
+    status = bmp.begin(BMP280_ADDR_2);
+    if (!status) {
+      // Serial.println(F("E1 ERREUR: Capteur BMP280 introuvable !")); // DEBUG IMPOSSIBLE
+      temperature = -99.9;
+    } else {
+       // Serial.println(F("E1: BMP280 trouvé addr 0x77.")); // DEBUG IMPOSSIBLE
+    }
+  } else {
+      // Serial.println(F("E1: BMP280 trouvé addr 0x76.")); // DEBUG IMPOSSIBLE
+  }
+  if (status) {
+    bmp.setSampling(Adafruit_BMP280::MODE_NORMAL, Adafruit_BMP280::SAMPLING_X2, Adafruit_BMP280::SAMPLING_X16, Adafruit_BMP280::FILTER_X16, Adafruit_BMP280::STANDBY_MS_500);
+    // Serial.println(F("E1: BMP280 configuré.")); // DEBUG IMPOSSIBLE
+  }
+}
+
+void setupUARTs() {
+  // UART1 pour communiquer avec E3 (RX=33, TX=32)
+  Serial_E3.begin(115200, SERIAL_8N1, E1_RX_FROM_E3_PIN, E1_TX_TO_E3_PIN);
+  // Serial.println("E1: UART1 (vers/depuis E3) initialisé"); // DEBUG IMPOSSIBLE
+  delay(100);
+  Serial_E3.println("E1:Hi_E3"); // Envoyer un message de test à E3
+}
+
+void setupDisplay() {
+  tft.init();
+  tft.setRotation(1); // A adapter si nécessaire
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("MONITEUR ELEVE 1", tft.width() / 2, 15);
+  tft.setTextDatum(TL_DATUM); // Retour défaut Top Left
+  delay(1500);
+  drawStaticUI(); // Dessine l'UI statique
+}
+
+// =========================================================================
+// FONCTIONS DE LECTURE/COMMUNICATION
+// =========================================================================
+float readVoltage() {
+  uint32_t sumReadings = 0;
+  const int numReadings = 20;
+  for (int i = 0; i < numReadings; i++) { sumReadings += analogRead(ANALOG_PIN); delay(1); }
+  return (float)sumReadings / numReadings * (ADC_REFERENCE / ADC_RESOLUTION);
+}
+
+float readTemperature() {
+  if (temperature == -99.9 && !bmp.begin()) return -99.9;
+  float tempReading = bmp.readTemperature();
+  if (isnan(tempReading)) { return temperature; } // Garder ancienne valeur si erreur
+  return tempReading;
+}
+
+void receiveAndProcessData() {
+  String receivedData;
+
+  // Vérifier données de E2 (RTC) via UART0 (Serial)
+  if (Serial.available()) { // Utilise Serial ici !
+    receivedData = Serial.readStringUntil('\n');
+    receivedData.trim();
+    if (receivedData.startsWith("E2:")) {
+      parseDataFromE2(receivedData);
+    }
+    // Ignorer les autres messages sur ce port pour l'instant
+  }
+
+  // Vérifier données de E3 (Light/GPS) via UART1 (Serial_E3)
+  if (Serial_E3.available()) {
+    receivedData = Serial_E3.readStringUntil('\n');
+    receivedData.trim();
+     if (receivedData.startsWith("E3:")) {
+      parseDataFromE3(receivedData);
+     }
+     // Ignorer les autres messages sur ce port pour l'instant
+  }
+}
+
+void parseDataFromE2(String data) {
+  // Format attendu: E2:TIME=hh:mm:ss,DATE=dd/mm/yyyy
+  int timeIndex = data.indexOf("TIME=");
+  int dateIndex = data.indexOf("DATE=");
+  if (timeIndex != -1 && dateIndex != -1) {
+    int commaIndex = data.indexOf(',', timeIndex);
+    if (commaIndex != -1) {
+        e2_time = data.substring(timeIndex + 5, commaIndex);
+        e2_date = data.substring(dateIndex + 5);
+        e2_time.trim();
+        e2_date.trim();
+    }
+  } // else: Erreur format -> on garde les anciennes valeurs
+}
+
+void parseDataFromE3(String data) {
+ // Format attendu: E3:LUX=val_lux,LAT=val_lat,LON=val_lon,FIX=0ou1
+  int luxIndex = data.indexOf("LUX=");
+  int latIndex = data.indexOf("LAT=");
+  int lonIndex = data.indexOf("LON=");
+  int fixIndex = data.indexOf("FIX=");
+  if (luxIndex != -1 && latIndex != -1 && lonIndex != -1 && fixIndex != -1) {
+    String luxStr = data.substring(luxIndex + 4, data.indexOf(',', luxIndex));
+    String latStr = data.substring(latIndex + 4, data.indexOf(',', latIndex));
+    String lonStr = data.substring(lonIndex + 4, data.indexOf(',', lonIndex));
+    String fixStr = data.substring(fixIndex + 4);
+    e3_lux = luxStr.toFloat();
+    e3_lat = latStr.toFloat();
+    e3_lon = lonStr.toFloat();
+    e3_gps_fix = (fixStr.toInt() == 1);
+  } // else: Erreur format -> on garde les anciennes valeurs
+}
+
+// Envoyer les données locales (Temp/Batt) à E2 via UART0 (Serial)
+void sendDataToE2() {
+    String dataToSend = "E1:TEMP=" + String(temperature, 1) + ",BATT=" + String(batteryPercentage);
+    Serial.println(dataToSend); // Utilise Serial ici !
+}
+
+// =========================================================================
+// FONCTIONS D'AFFICHAGE (TFT)
+// =========================================================================
+void drawStaticUI() {
+    int screenW = tft.width();
+    int screenH = tft.height();
+    int currentY = 30; // Position Y de départ sous le titre
+
+    tft.fillScreen(TFT_NAVY); // Redessine le fond sous le titre
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(1);
+
+    // Recalcul des positions pour potentiellement plus de données
+    // Section E2 (RTC)
+    tft.setCursor(5, currentY); tft.print("E2 RTC:");
+    tft.drawFastHLine(0, currentY + 10, screenW, TFT_DARKGREY);
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Date:");
+    tft.setCursor(screenW / 2, currentY); tft.print("Heure:");
+    currentY += 15;
+
+    // Section E3 (Lux/GPS)
+    tft.setCursor(5, currentY); tft.print("E3 Lux/GPS:");
+    tft.drawFastHLine(0, currentY + 10, screenW, TFT_DARKGREY);
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Lux:");
+    tft.setCursor(screenW / 2, currentY); tft.print("GPS Fix:");
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Lat:");
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Lon:");
+    currentY += 15;
+
+    // Section Locale (Temp/Batt)
+    tft.setCursor(5, currentY); tft.print("E1 Local:");
+    tft.drawFastHLine(0, currentY + 10, screenW, TFT_DARKGREY);
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Temp:");
+    tft.setCursor(screenW / 2, currentY); tft.print("Batt(%):"); // Affiche pourcentage direct
+    currentY += 15;
+    tft.setCursor(10, currentY); tft.print("Batt(V):"); // Affiche tension
+}
+
+void updateDisplayData() {
+    int screenW = tft.width();
+    int yOffset = 30 + 15; // Décalage Y basé sur drawStaticUI
+
+    tft.setTextSize(1); // Petite taille pour tout afficher
+
+    // --- Données E2 (RTC) ---
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    // Date
+    tft.fillRect(50, yOffset, 90, 10, TFT_NAVY);
+    tft.setCursor(50, yOffset); tft.print(e2_date);
+    // Heure
+    tft.fillRect(screenW / 2 + 45, yOffset, 70, 10, TFT_NAVY);
+    tft.setCursor(screenW / 2 + 45, yOffset); tft.print(e2_time);
+    yOffset += 15 + 15;
+
+    // --- Données E3 (Light/GPS) ---
+    tft.setTextColor(TFT_MAGENTA, TFT_NAVY);
+    // Lux
+    tft.fillRect(50, yOffset, 70, 10, TFT_NAVY);
+    tft.setCursor(50, yOffset);
+    if (e3_lux < 0) tft.print("--- lx"); else tft.print(String(e3_lux, 0) + " lx");
+    // GPS Fix
+    tft.fillRect(screenW / 2 + 55, yOffset, 40, 10, TFT_NAVY);
+    tft.setCursor(screenW / 2 + 55, yOffset); tft.print(e3_gps_fix ? "OK" : "NO");
+    yOffset += 15;
+     // Latitude
+    tft.fillRect(50, yOffset, 150, 10, TFT_NAVY);
+    tft.setCursor(50, yOffset);
+    if (!e3_gps_fix) tft.print("--.------"); else tft.print(String(e3_lat, 6));
+    yOffset += 15;
+     // Longitude
+    tft.fillRect(50, yOffset, 150, 10, TFT_NAVY);
+    tft.setCursor(50, yOffset);
+     if (!e3_gps_fix) tft.print("--.------"); else tft.print(String(e3_lon, 6));
+    yOffset += 15 + 15;
+
+    // --- Données Locales ---
+    // Température
+    tft.fillRect(50, yOffset, 70, 10, TFT_NAVY);
+    tft.setTextColor(TFT_CYAN, TFT_NAVY);
+    tft.setCursor(50, yOffset);
+    if (temperature == -99.9) tft.print("--.- C"); else tft.print(String(temperature, 1) + " C");
+    // Batterie (%)
+    tft.fillRect(screenW / 2 + 55, yOffset, 50, 10, TFT_NAVY);
+    tft.setTextColor(TFT_YELLOW, TFT_NAVY);
+    tft.setCursor(screenW / 2 + 55, yOffset); tft.print(String(batteryPercentage) + " %");
+    yOffset += 15;
+    // Batterie (V)
+    tft.fillRect(50, yOffset, 70, 10, TFT_NAVY);
+    tft.setTextColor(TFT_YELLOW, TFT_NAVY);
+    tft.setCursor(50, yOffset); tft.print(String(batteryVoltage, 1) + " V");
+}
+
+// =========================================================================
+// FONCTION D'ENVOI BLUETOOTH
+// =========================================================================
+void sendDataBluetooth() {
+  String data = "{";
+  // Local E1
+  data += "\"e1_temp\":" + String(temperature, 1) + ",";
+  data += "\"e1_volt\":" + String(batteryVoltage, 2) + ",";
+  data += "\"e1_batt\":" + String(batteryPercentage) + ",";
+  // Reçu E2
+  data += "\"e2_time\":\"" + e2_time + "\",";
+  data += "\"e2_date\":\"" + e2_date + "\",";
+   // Reçu E3
+  data += "\"e3_lux\":" + String(e3_lux, 0) + ",";
+  data += "\"e3_lat\":" + String(e3_lat, 6) + ",";
+  data += "\"e3_lon\":" + String(e3_lon, 6) + ",";
+  data += "\"e3_fix\":" + String(e3_gps_fix ? 1 : 0);
+  data += "}";
+
+  if (SerialBT.connected()) {
+       SerialBT.println(data);
+  }
+}
